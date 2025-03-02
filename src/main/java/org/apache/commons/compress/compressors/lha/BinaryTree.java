@@ -1,0 +1,139 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.commons.compress.compressors.lha;
+
+import java.io.IOException;
+import java.util.Arrays;
+
+import org.apache.commons.compress.compressors.CompressorException;
+import org.apache.commons.compress.utils.BitInputStream;
+import org.apache.commons.lang3.ArrayFill;
+
+/**
+ * Binary tree of positive values.
+ *
+ * Copied from org.apache.commons.compress.archivers.zip.BinaryTree and modified for LHA.
+ */
+class BinaryTree {
+
+    /** Value in the array indicating an undefined node */
+    private static final int UNDEFINED = -1;
+
+    /** Value in the array indicating a non leaf node */
+    private static final int NODE = -2;
+
+    /**
+     * The array representing the binary tree. The root is at index 0, the left children (0) are at 2*i+1 and the right children (1) at 2*i+2.
+     */
+    protected final int[] tree;
+
+    BinaryTree(int array[]) {
+        if (array.length == 1) {
+            // Tree only contains a single value, which is the root node value
+            this.tree = new int[] { array[0] };
+            return;
+        }
+
+        // Determine the maximum depth of the tree from the input array
+        int maxDepth = Arrays.stream(array).max().getAsInt();
+
+        // Allocate binary tree with enough space for all nodes
+        this.tree = initTree(maxDepth);
+
+        int treePos = 0;
+
+        // Add root node pointing to left (0) and right (1) children
+        this.tree[treePos++] = NODE;
+
+        // Iterate over each possible tree depth (starting from 1)
+        for (int currentDepth = 1; currentDepth <= maxDepth; currentDepth++) {
+            int startPos = (1 << currentDepth) - 1; // Start position for the first node at this depth
+            int maxNodesAtCurrentDepth = (1 << currentDepth); // Max number of nodes at this depth
+            int numNodesAtCurrentDepth = treePos - startPos; // Number of nodes added at this depth taking into account any already skipped nodes (a.k.a UNDEFINED)
+
+            // Add leaf nodes for values with the current depth
+            for (int value = 0; value < array.length; value++) {
+                if (array[value] == currentDepth) {
+                    this.tree[treePos++] = value; // Add leaf (value) node
+                    numNodesAtCurrentDepth++;
+                }
+            }
+
+            // Add nodes pointing to child nodes until the maximum number of nodes at this depth is reached
+            int skipToTreePos = -1;
+            while (currentDepth != maxDepth && numNodesAtCurrentDepth < maxNodesAtCurrentDepth) {
+                if (skipToTreePos == -1) {
+                    skipToTreePos = (2 * treePos + 1); // Next tree position that this node's left (0) child would occupy
+                }
+
+                this.tree[treePos++] = NODE; // Add node pointing to left (0) and right (1) children
+                numNodesAtCurrentDepth++;
+            }
+
+            if (skipToTreePos != -1) {
+                treePos = skipToTreePos; // Skip to the next known tree position based on the first node at this depth
+            }
+        }
+    }
+
+    /**
+     * Initializes the binary tree with the specified depth but with all nodes as UNDEFINED.
+     *
+     * @param depth the depth of the tree, must be between 0 and 16 (inclusive)
+     * @return an array representing the binary tree, initialized with UNDEFINED values
+     */
+    protected int[] initTree(int depth) {
+        if (depth < 0 || depth > 16) {
+            throw new IllegalArgumentException("Depth must not be negative and not bigger than 16 but is " + depth);
+        }
+
+        int arraySize = depth == 0 ? 1 : (int) ((1L << depth + 1) - 1); // Depth 0 has only a single node (the root)
+
+        return ArrayFill.fill(new int[arraySize], UNDEFINED);
+    }
+
+    /**
+     * Reads a value from the specified bit stream.
+     *
+     * @param stream The data source.
+     * @return the value decoded, or -1 if the end of the stream is reached
+     * @throws IOException on error.
+     */
+    public int read(final BitInputStream stream) throws IOException {
+        int currentIndex = 0;
+
+        while (true) {
+            final int value = tree[currentIndex];
+            if (value == NODE) {
+                // Consume the next bit
+                final int bit = stream.readBit();
+                if (bit == -1) {
+                    return -1;
+                }
+
+                currentIndex = 2 * currentIndex + 1 + bit;
+            } else if (value == UNDEFINED) {
+                throw new CompressorException("Invalid bitstream. The node at index " + currentIndex + " is not defined.");
+            } else {
+                return value;
+            }
+        }
+    }
+}

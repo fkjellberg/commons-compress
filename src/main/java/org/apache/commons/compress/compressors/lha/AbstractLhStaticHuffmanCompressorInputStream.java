@@ -1,0 +1,363 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.commons.compress.compressors.lha;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteOrder;
+
+import org.apache.commons.compress.compressors.CompressorException;
+import org.apache.commons.compress.compressors.CompressorInputStream;
+import org.apache.commons.compress.utils.BitInputStream;
+import org.apache.commons.compress.utils.CircularBuffer;
+import org.apache.commons.compress.utils.InputStreamStatistics;
+import org.apache.commons.io.input.CloseShieldInputStream;
+
+/**
+ * This is an implementation of a static Huffman compressor input stream for LHA files that
+ * supports Lh4, Lh5, Lh6 and Lh7 compression methods.
+ *
+ * This implementation is based on the documentation written by Koji Arai that can be found at
+ * https://github.com/jca02266/lha/blob/master/Hacking_of_LHa
+ *
+ * @since 1.29
+ */
+public abstract class AbstractLhStaticHuffmanCompressorInputStream extends CompressorInputStream implements InputStreamStatistics {
+    // Constants for command tree decoding
+    private static final int COMMAND_DECODING_LENGTH_BITS = 5; // Number of bits used to encode the command decoding tree length
+    private static final int MAX_NUMBER_OF_COMMAND_DECODING_CODE_LENGTHS = 19; // Maximum number of codes in the command decoding tree
+
+    // Constants for command tree
+    private static final int COMMAND_TREE_LENGTH_BITS = 9; // Number of bits used to encode the command tree length
+
+    // Constants for code length
+    private static final int CODE_LENGTH_BITS = 3; // Number of bits used to encode the code length
+    private static final int MAX_CODE_LENGTH = 16;
+
+    private BitInputStream bin;
+    private CircularBuffer buffer;
+    private long blockSize = 0;
+    private BinaryTree commandTree; // Command is either a literal or a copy command
+    private BinaryTree distanceTree; // Distance is the offset to copy from the sliding dictionary
+
+    /**
+     * Constructs a new CompressorInputStream which decompresses bytes read from the specified stream.
+     * files.
+     *
+     * @param in the InputStream from which to read compressed data
+     * @throws IOException if an I/O error occurs
+     */
+    public AbstractLhStaticHuffmanCompressorInputStream(final InputStream in) throws IOException {
+        this.bin = new BitInputStream(in == System.in ? CloseShieldInputStream.wrap(in) : in, ByteOrder.BIG_ENDIAN);
+
+        // Create a sliding dictionary buffer that can hold the full dictionary size and the maximum match length
+        this.buffer = new CircularBuffer(getDictionarySize() + getMaxMatchLength());
+    }
+
+    @Override
+    public void close() throws IOException {
+        if (this.bin != null) {
+            try {
+                this.bin.close();
+            } finally {
+                this.bin = null;
+                this.buffer = null;
+                this.blockSize = -1;
+            }
+        }
+    }
+
+    /**
+     * Get the threshold for copying data from the sliding dictionary. This is the minimum
+     * possible number of bytes that will be part of a copy command.
+     *
+     * @return the copy threshold
+     */
+    protected int getCopyThreshold() {
+        return 3;
+    }
+
+    /**
+     * Get the number of bits used for the dictionary size.
+     *
+     * @return the number of bits used for the dictionary size
+     */
+    protected abstract int getDictionaryBits();
+
+    /**
+     * Get the size of the dictionary.
+     *
+     * @return the size of the dictionary
+     */
+    protected int getDictionarySize() {
+        return 1 << getDictionaryBits();
+    }
+
+    /**
+     * Get the number of bits used for the distance.
+     *
+     * @return the number of bits used for the distance
+     */
+    protected abstract int getDistanceBits();
+
+    protected int getDistanceCodeSize() {
+        return getDictionaryBits() + 1;
+    }
+
+    /**
+     * Get the maximum match length for the copy command.
+     *
+     * @return the maximum match length
+     */
+    protected int getMaxMatchLength() {
+        return 256;
+    }
+
+    /**
+     * Get the maximum number of commands in the command tree.
+     * This is 256 literals (0-255) and 254 copy lengths combinations (3-256).
+     *
+     * @return the maximum number of commands
+     */
+    protected int getMaxNumberOfCommands() {
+        return 256 + getMaxMatchLength() - getCopyThreshold() + 1;
+    }
+
+    @Override
+    public long getCompressedCount() {
+        return bin.getBytesRead();
+    }
+
+    @Override
+    public int read() throws IOException {
+        if (!buffer.available()) {
+            // Nothing in the buffer, try to fill it
+            fillBuffer();
+        }
+
+        final int ret = buffer.get();
+        count(ret < 0 ? 0 : 1); // Increment input stream statistics
+        return ret;
+    }
+
+    /**
+     * Fill the sliding dictionary with more data.
+     *
+     * @throws IOException if an I/O error occurs
+     */
+    private void fillBuffer() throws IOException {
+        if(this.blockSize == 0) {
+            // Start to read the next block
+
+            // Read the block size (number of commands to read)
+            this.blockSize = bin.readBits(16);
+            if(this.blockSize == -1) {
+                // End of stream
+                return;
+            }
+
+            BinaryTree commandDecodingTree = readCommandDecodingTree();
+            //commandDecodingTree.printTree();
+
+            this.commandTree = readCommandTree(commandDecodingTree);
+            //this.commandTree.printTree();
+
+            this.distanceTree = readDistanceTree();
+            //this.distanceTree.printTree();
+        }
+        else if(this.blockSize == -1) {
+            // End of stream
+            return;
+        }
+
+        this.blockSize--;
+
+        int command = commandTree.read(bin);
+        if (command < 0x100) {
+            // Literal command, just write the byte to the buffer
+            //System.out.println("Read char: " + (char)command);
+            buffer.put(command);
+        } else {
+            // Copy command, read the distance and calculate the length from the command
+            int distance = readDistance();
+            int length = command - 0x100 + getCopyThreshold();
+
+            //System.out.println("Read command command=" + command + " distance=" + distance + " length=" + length);
+
+            // Copy the data from the sliding dictionary and add to the buffer
+            buffer.copy(distance + 1, length);
+        }
+    }
+
+    /**
+     * Read the command decoding tree. The command decoding tree is used when reading the command tree
+     * which is then actually used to decode the commands (literals or copy commands).
+     *
+     * @return the command decoding tree
+     * @throws IOException if an I/O error occurs
+     */
+    protected BinaryTree readCommandDecodingTree() throws IOException {
+        // Number of code lengths to read
+        int numCodeLengths = (int)bin.readBits(COMMAND_DECODING_LENGTH_BITS);
+
+        if(numCodeLengths > MAX_NUMBER_OF_COMMAND_DECODING_CODE_LENGTHS) {
+            throw new CompressorException("Code length table has invalid size (" + numCodeLengths + " > " + MAX_NUMBER_OF_COMMAND_DECODING_CODE_LENGTHS + ")");
+        } else if(numCodeLengths == 0) {
+            // If numCodeLengths is zero, we read a single code length of COMMAND_DECODING_LENGTH_BITS bits and use as root of the tree
+            return new BinaryTree(new int[] { (int)bin.readBits(COMMAND_DECODING_LENGTH_BITS) });
+        } else {
+            // Read all code lengths
+            int codeLengths[] = new int[numCodeLengths];
+            for (int index = 0; index < numCodeLengths; index++) {
+                codeLengths[index] = readCodeLength();
+
+                if(index == 2) {
+                    // After reading the first three code lengths, we read a 2-bit skip range
+                    index += bin.readBits(2);
+                }
+            }
+
+            //System.out.println("=== readCommandDecodingTree returns: " + Arrays.toString(codeLengths));
+
+            return new BinaryTree(codeLengths);
+        }
+    }
+
+    /**
+     * Read code length (depth in tree). Usually 0-7 but could be higher and if so,
+     * count the number of following consecutive one bits and add to the length.
+     *
+     * @return code length
+     * @throws IOException if an I/O error occurs
+     */
+    protected int readCodeLength() throws IOException {
+        int len = (int)bin.readBits(CODE_LENGTH_BITS);
+        if (len == 0x07) {
+            // Count the number of following consecutive one bits
+            while (bin.readBit() == 1) {
+                if (len == MAX_CODE_LENGTH) {
+                    throw new CompressorException("Code length overflow");
+                }
+
+                len++;
+            }
+        }
+
+        return len;
+    }
+
+    /**
+     * Read the command tree which is used to decode the commands (literals or copy commands).
+     *
+     * @param huffmanTree the Huffman tree used to decode the command lengths
+     * @return the command tree
+     * @throws IOException if an I/O error occurs
+     */
+    protected BinaryTree readCommandTree(BinaryTree huffmanTree) throws IOException {
+        int numCodeLengths = (int)bin.readBits(COMMAND_TREE_LENGTH_BITS);
+
+        if (numCodeLengths > getMaxNumberOfCommands()) {
+            throw new CompressorException("Code length table has invalid size (" + numCodeLengths + " > " + getMaxNumberOfCommands() + ")");
+        } else if(numCodeLengths == 0) {
+            // If numCodeLengths is zero, we read a single code length of COMMAND_TREE_LENGTH_BITS bits and use as root of the tree
+            return new BinaryTree(new int[] { (int)bin.readBits(COMMAND_TREE_LENGTH_BITS) });
+        } else {
+            // Read all code lengths
+            int codeLengths[] = new int[numCodeLengths];
+
+            for (int index = 0; index < numCodeLengths;) {
+                int codeOrSkipRange = huffmanTree.read(bin);
+
+                if (codeOrSkipRange == 0) {
+                    // Skip one code length
+                    index++;
+                }
+                else if (codeOrSkipRange == 1) {
+                    // Skip a range of code lengths, read 4 bits to determine how many to skip
+                    index += bin.readBits(4) + 3;
+                }
+                else if (codeOrSkipRange == 2) {
+                    // Skip a range of code lengths, read 9 bits to determine how many to skip
+                    index += bin.readBits(9) + 20;
+                }
+                else {
+                    // Subtract 2 from the codeOrSkipRange to get the code length
+                    codeLengths[index++] = codeOrSkipRange - 2;
+                }
+            }
+
+            //System.out.println("=== readCodeLen returns codeLen: " + Arrays.toString(codeLengths));
+
+            return new BinaryTree(codeLengths);
+        }
+    }
+
+    /**
+     * Read the distance tree which is used to decode the distance of the copy command.
+     *
+     * @return the distance tree
+     * @throws IOException if an I/O error occurs
+     */
+    protected BinaryTree readDistanceTree() throws IOException {
+        // Number of code lengths to read
+        int numCodeLengths = (int)bin.readBits(getDistanceBits());
+
+        if (numCodeLengths > getDistanceCodeSize()) {
+            throw new CompressorException("Code length table has invalid size (" + numCodeLengths + " > " + getDistanceCodeSize() + ")");
+        } else if (numCodeLengths == 0) {
+            // If numCodeLengths is zero, we read a single code length of getDistanceBits() bits and use as root of the tree
+            return new BinaryTree(new int[] { (int)bin.readBits(getDistanceBits()) });
+        } else {
+            // Read all code lengths
+            int[] codeLengths = new int[numCodeLengths];
+            for (int index = 0; index < numCodeLengths; index++) {
+                codeLengths[index] = readCodeLength();
+            }
+
+            //System.out.println("=== readDistanceTree returns: " + Arrays.toString(codeLengths));
+
+            return new BinaryTree(codeLengths);
+        }
+    }
+
+    /**
+     * Read the distance by first decoding the number of bits to read from the distance tree
+     * and then reading the actual distance value from the bit input stream.
+     *
+     * @return the distance
+     * @throws IOException if an I/O error occurs
+     */
+    protected int readDistance() throws IOException {
+        // Determine the number of bits to read for the distance by reading an entry from the distance tree
+        int bits = distanceTree.read(bin);
+
+        if(bits == 0 || bits == 1) {
+            // This is effectively run length encoding
+            return bits;
+        }
+        else {
+            // Bits minus one is the number of bits to read for the distance
+            int value = (int)bin.readBits(bits - 1);
+
+            // Add the implicit bit (1 << (bits - 1)) to the value read from the stream giving the distance.
+            // E.g. if bits is 6, we read 5 bits giving value 8 and then we add 32 giving a distance of 40.
+            return value | (1 << (bits - 1));
+        }
+    }
+}
