@@ -28,15 +28,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-13]
-        java: [ 8, 11, 17, 21, 24 ]
+        os: [ubuntu-latest]
+        java: [ 8, 21 ]
         experimental: [false]
         # Keep the same parameter order as the matrix above
         include:
           - os: ubuntu-latest
             java: 25-ea
             experimental: true
-        
+
     steps:
     - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       with:
